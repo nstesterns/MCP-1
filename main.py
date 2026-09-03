@@ -1,5 +1,5 @@
 """
-FastMCP quickstart example.
+FastMCP--1 quickstart example.
 
 Run:
     uv run server fastmcp_quickstart stdio
@@ -17,7 +17,7 @@ load_dotenv()
 port = int(os.environ.get("PORT", 10000))
 
 # Create an MCP server
-mcp = FastMCP("Demo")
+mcp = FastMCP("Demo--legacy")
 
 # -------------------------------------------------
 # 🧰 TOOLS
