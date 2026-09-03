@@ -1,5 +1,5 @@
 [project]
-name = "mcp-test-legacy"
+name = "mcp"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
