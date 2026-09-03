@@ -276,7 +276,6 @@ async def api_summary(request: Request) -> JSONResponse:
         "endpoints": {
             "GET /api/ping":                            "Health check",
             "GET /api/summary":                         "This page",
-            "",
             "GET /api/test/progress":                   "ProgressNotification — 5-step progress",
             "GET /api/test/logging":                    "LoggingMessageNotification — 6 levels",
             "GET /api/test/tool-list-changed":          "ToolListChangedNotification",
