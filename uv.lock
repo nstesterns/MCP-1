@@ -198,7 +198,7 @@ cli = [
 ]
 
 [[package]]
-name = "mcp-test"
+name = "mcp-1"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
