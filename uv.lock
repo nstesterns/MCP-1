@@ -49,7 +49,6 @@ version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
        { name = "certifi" },
-       { name = "charset-normalizer" },
        { name = "idna" },
        { name = "urllib3" },
    ]
