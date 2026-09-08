@@ -1,517 +1,652 @@
-#!/usr/bin/env python3
 """
-EVIL MCP server — ENG-1226340 sanitization test fixture (STANDALONE).
+MCP server with ALL capabilities for Postman + Claude Desktop testing.
 
-Fully self-contained copy of mcp_server_2026.py (2026-07-28 protocol,
-session-less, dual-stack legacy fallback) with hostile data baked in:
-  * tool / prompt / resource names containing JSON injection, newlines,
-    control chars, HTML, unicode/RTL/emoji, and an oversized (10KB) name
-  * serverInfo.name is ALWAYS hostile
-  * response headers (Mcp-Name / Mcp-Method) are pre-sanitized so hostile
-    names don't break HTTP header encoding
+Two ways to interact:
+  1. MCP protocol  → POST http://localhost:10000/mcp
+  2. REST API      → GET http://localhost:10000/api/*        (plain JSON, for Postman)
+
+Includes:
+  - All 9 notification type test tools (test_1 through test_9)
+  - REST API endpoints for Postman
+  - Completion handler (autocomplete)
+  - Resource subscribe/unsubscribe handlers
+  - Roots list tool
+  - Original tools (greet, add, elicitation, etc.)
 
 Run:
-  python mcp_server_evil.py          # PORT env, default 10002
-
-Drive it with:
-  python mcp_sanitize_tests.py --url http://localhost:10002/mcp
-  python mcp_sanitize_tests.py --url http://localhost:10002/mcp --proxy http://10.156.22.20:8081
-
-Deploy note: run this as a SEPARATE service from the clean server — the
-hostile serverInfo would poison the proxy's cached server name otherwise.
+    python mcp_server_postman.py
 """
 
 import asyncio
-import json
-import os
 import time
-import uuid
-from typing import Any
-
-from starlette.applications import Starlette
+import json
+from typing import Optional
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
-
-PROTOCOL_VERSION = "2026-07-28"
-SERVER_NAME = 'evil-srv","injected":"yes\n<script>alert(1)</script>'   # ALWAYS hostile
-SERVER_VERSION = "1.0.0"
-PORT = int(os.environ.get("PORT", "10002"))
-
-# Meta keys used by the 2026-07-28 spec.
-META_PROTOCOL = "io.modelcontextprotocol/protocolVersion"
-META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
-META_CLIENT_CAPS = "io.modelcontextprotocol/clientCapabilities"
-META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
-
-# Legacy (pre-2026) protocol versions this server can fall back to.
-LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
-SUPPORTED_VERSIONS = [PROTOCOL_VERSION] + LEGACY_VERSIONS
-
-# session_id -> {"version": str, "created": float}  (legacy session-based clients)
-SESSIONS: dict = {}
-
-# ---------------------------------------------------------------------------
-# Data used by tools/resources (DLP-relevant payloads)
-# ---------------------------------------------------------------------------
-
-EICAR = r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
-
-EMPLOYEES = [
-    {"id": 101, "name": "Alice Johnson", "role": "Software Engineer", "department": "Engineering", "email": "alice.johnson@bobsbank.net", "location": "New York", "ssn": "123-45-6789"},
-    {"id": 102, "name": "Bob Smith", "role": "QA Engineer", "department": "Quality Assurance", "email": "bob.smith@bobsbank.net", "location": "San Francisco", "ssn": "987-65-4321"},
-    {"id": 103, "name": "Charlie Brown", "role": "Product Manager", "department": "Product", "email": "charlie.brown@bobsbank.net", "location": "London", "ssn": "555-22-3333"},
-    {"id": 104, "name": "Diana Prince", "role": "DevOps Engineer", "department": "Infrastructure", "email": "diana.prince@bobsbank.net", "location": "Berlin", "ssn": "111-22-3333"},
-    {"id": 105, "name": "Ethan Hunt", "role": "Security Analyst", "department": "Cybersecurity", "email": "ethan.hunt@bobsbank.net", "location": "Singapore", "ssn": "444-55-6666"},
-]
-
-PCI_CARDS = [
-    {"brand": "Visa", "number": "4111111111111111"},
-    {"brand": "Mastercard", "number": "5555555555554444"},
-    {"brand": "Amex", "number": "378282246310005"},
-    {"brand": "Discover", "number": "6011111111111117"},
-]
-
-CONFIDENTIAL = "Bob's Bank is planning to acquire Fabio Insurance in February 2026"
-
-# ---------------------------------------------------------------------------
-# Tools (normal + EVIL sanitization fixtures)
-# ---------------------------------------------------------------------------
-
-def _text(*parts) -> dict:
-    return {"type": "text", "text": " ".join(str(p) for p in parts)}
-
-TOOLS = {
-    "greet": {
-        "description": "Greet someone (no LLM sampling in the new protocol).",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
-        "handler": lambda a: _text("Hello,", a.get("name", "World")),
-    },
-    "add": {
-        "description": "Add two numbers.",
-        "inputSchema": {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}, "required": ["a", "b"]},
-        "handler": lambda a: _text(int(a.get("a", 0)) + int(a.get("b", 0))),
-    },
-    "get_eicar": {
-        "description": "Return the EICAR anti-malware test string.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text(EICAR),
-    },
-    "get_employees": {
-        "description": "Return employee records containing PII.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text(json.dumps({"employees": EMPLOYEES})),
-    },
-    "get_pci": {
-        "description": "Return sample PCI card numbers.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text(json.dumps({"cards": PCI_CARDS})),
-    },
-    "get_confidential": {
-        "description": "Return confidential M&A text.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text(CONFIDENTIAL),
-    },
-    "test_progress": {
-        "description": "Progress demo (steps reported inline).",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("Progress: 5/5 steps complete (100%)"),
-    },
-    "test_logging": {
-        "description": "Logging demo (log levels reported inline).",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("Logs emitted at debug/info/notice/warning/error/critical"),
-    },
-    "list_templates": {
-        "description": "List registered resource URI templates.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("Available templates: greeting://{name}"),
-    },
-    # ---- MRTR / elicitation (best-effort input_required shape) ----
-    "elicit_feedback": {
-        "description": "Ask the client a question via input_required (MRTR).",
-        "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
-        "result_type": "input_required",
-        "handler": lambda a: {
-            "kind": "elicitation",
-            "message": a.get("question", "Please provide feedback"),
-            "schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
-        },
-    },
-    "collect_user_info": {
-        "description": "Request user info via input_required (MRTR).",
-        "inputSchema": {"type": "object", "properties": {}},
-        "result_type": "input_required",
-        "handler": lambda a: {
-            "kind": "elicitation",
-            "message": "Please provide your name and preferred language.",
-            "schema": {"type": "object", "properties": {"name": {"type": "string"}, "language": {"type": "string"}}, "required": ["name", "language"]},
-        },
-    },
-    # ---- EVIL fixtures (ENG-1226340) ----
-    'evil_inj","injected":"yes': {
-        "description": "JSON injection attempt via tool name.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("evil inj ok"),
-    },
-    "evil_newline\nforged-log-line": {
-        "description": "Newline injection in tool name.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("evil newline ok"),
-    },
-    "evil_html_<script>alert(1)</script>": {
-        "description": "HTML/JS injection in tool name.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("evil html ok"),
-    },
-    "evil_ctrl_\x00\x01\x1f": {
-        "description": "Control characters in tool name.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("evil ctrl ok"),
-    },
-    "evil_unicode_\u202e\u263a\U0001F680": {
-        "description": "Unicode / RTL override / emoji in tool name.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("evil unicode ok"),
-    },
-    "evil_long_" + "A" * 10000: {
-        "description": "Oversized (10KB) tool name.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "handler": lambda a: _text("evil long ok"),
-    },
-}
-
-# ---------------------------------------------------------------------------
-# Resources / prompts (normal + EVIL fixtures)
-# ---------------------------------------------------------------------------
-
-RESOURCES = {
-    "greeting://test":     {"name": "get_greeting_test",   "description": "A test greeting.",                 "mimeType": "text/plain",       "text": "Hello, test!",                     "cacheScope": "public"},
-    "greeting://eicar":    {"name": "get_greeting_eicar",  "description": "EICAR anti-malware test string.",  "mimeType": "text/plain",       "text": EICAR,                              "cacheScope": "public"},
-    "confidential://news": {"name": "get_confidential_news","description": "Confidential M&A news.",          "mimeType": "text/plain",       "text": CONFIDENTIAL,                       "cacheScope": "private"},
-    "employees://details": {"name": "get_employee_details","description": "Employee records (contains PII).", "mimeType": "application/json", "text": json.dumps({"employees": EMPLOYEES}), "cacheScope": "private"},
-    "pci://sample":        {"name": "get_pci_sample",      "description": "Sample PCI card numbers.",         "mimeType": "application/json", "text": json.dumps({"cards": PCI_CARDS}),     "cacheScope": "private"},
-    # ---- EVIL fixtures (ENG-1226340) ----
-    'evilres://inj","x":"y': {"name": 'evil_res","injected":"1', "description": "JSON injection via resource name/uri.", "mimeType": "text/plain", "text": "evil resource",  "cacheScope": "public"},
-    "evilres://new\nline":   {"name": "evil_res_new\nline",     "description": "Newline in resource name/uri.",        "mimeType": "text/plain", "text": "evil resource 2", "cacheScope": "public"},
-}
-
-RESOURCE_TEMPLATES = [
-    {"name": "get_greeting", "uriTemplate": "greeting://{name}", "description": "Get a personalized greeting.", "mimeType": "text/plain"},
-]
-
-PROMPTS = {
-    "greet_user": {
-        "description": "A prompt asking for a greeting.",
-        "text": "Write a warm greeting for {name} in a {style} style.",
-        "arguments": [
-            {"name": "name",  "description": "Who to greet",                            "required": True},
-            {"name": "style", "description": "Greeting style (friendly/formal/casual)", "required": False},
-        ],
-    },
-    "pii_pci_analyzer": {
-        "description": "A prompt for detecting PII/PCI/PHI.",
-        "text": "Identify PII/PCI/PHI in: {text}",
-        "arguments": [
-            {"name": "text",     "description": "Text to analyze",        "required": True},
-            {"name": "category", "description": "Category (pii/pci/phi)", "required": False},
-        ],
-    },
-    # ---- EVIL fixture (ENG-1226340) ----
-    'evil_prompt","injected":"yes': {
-        "description": "Prompt name with JSON injection attempt.",
-        "text": "Say hi to {name}.",
-        "arguments": [{"name": "name", "description": "name", "required": False}],
-    },
-}
-
-# Advertised in initialize / server/discover.
-CAPABILITIES = {
-    "tools": {"listChanged": False},
-    "resources": {"subscribe": False, "listChanged": False},
-    "prompts": {"listChanged": False},
-    "completions": {},
-}
-
-# ---------------------------------------------------------------------------
-# JSON-RPC core
-# ---------------------------------------------------------------------------
-
-def make_result(result_obj, meta=True, version=PROTOCOL_VERSION):
-    """Wrap a protocol result; 2026 adds resultType + serverInfo meta,
-    legacy versions get the classic unwrapped shape."""
-    if version == PROTOCOL_VERSION:
-        if "resultType" not in result_obj:
-            result_obj["resultType"] = "complete"
-        if meta and "_meta" not in result_obj:
-            result_obj["_meta"] = {META_SERVER_INFO: {"name": SERVER_NAME, "version": SERVER_VERSION}}
-    return result_obj
-
-async def call_handler(handler, args):
-    r = handler(args)
-    if asyncio.iscoroutine(r):
-        r = await r
-    return r
-
-def _tools_list():
-    return [
-        {
-            "name": name,
-            "title": name,
-            "description": spec["description"],
-            "inputSchema": spec["inputSchema"],
-        }
-        for name, spec in TOOLS.items()
-    ]
-
-def _resources_list():
-    return [
-        {"uri": u, "name": r["name"], "title": r["name"],
-         "description": r["description"], "mimeType": r["mimeType"]}
-        for u, r in RESOURCES.items()
-    ]
-
-def _templates_list():
-    return [
-        {**t, "title": t["name"]}
-        for t in RESOURCE_TEMPLATES
-    ]
-
-def _prompts_list():
-    return [
-        {"name": k, "title": k, "description": v["description"], "arguments": v.get("arguments", [])}
-        for k, v in PROMPTS.items()
-    ]
-
-async def dispatch(method, params, request_meta, ctx):
-    """Return a JSON-RPC result dict, or raise RuntimeError for errors."""
-    params = params or {}
-    version = ctx["version"]
-    mr = lambda obj, meta=True: make_result(obj, meta=meta, version=version)
-    print(f"[{version}] <- {method}  _meta={json.dumps(request_meta, default=str)[:200]}")
-
-    if method == "initialize":
-        requested = params.get("protocolVersion", LEGACY_VERSIONS[0])
-        negotiated = requested if requested in SUPPORTED_VERSIONS else LEGACY_VERSIONS[0]
-        ctx["version"] = negotiated
-        return {
-            "protocolVersion": negotiated,
-            "capabilities": CAPABILITIES,
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        }
-
-    if method == "ping":
-        return mr({})
-
-    if method == "server/discover":
-        return mr({
-            "supportedVersions": SUPPORTED_VERSIONS,
-            "capabilities": CAPABILITIES,
-            "instructions": "EVIL demo MCP server (ENG-1226340 fixture). Speaks 2026-07-28; "
-                            "legacy clients may connect via the classic initialize handshake.",
-            "ttlMs": 3600000,
-            "cacheScope": "public",
-        })
-
-    if method == "tools/list":
-        return mr({
-            "tools": _tools_list(),
-            "ttlMs": 60000,
-            "cacheScope": "public",
-        })
-
-    if method == "tools/call":
-        name = params.get("name")
-        arguments = params.get("arguments", {})
-        input_responses = params.get("inputResponses")
-        if name not in TOOLS:
-            raise RuntimeError(f"Tool not found: {name}")
-        spec = TOOLS[name]
-        if spec.get("result_type") == "input_required" and not input_responses:
-            payload = await call_handler(spec["handler"], arguments)
-            if version == PROTOCOL_VERSION:
-                return mr({
-                    "resultType": "input_required",
-                    "inputRequests": [{
-                        "id": str(uuid.uuid4()),
-                        "kind": payload.get("kind", "elicitation"),
-                        "message": payload.get("message", ""),
-                        "schema": payload.get("schema", {}),
-                    }],
-                })
-            return mr({"content": [_text(payload.get("message", ""))]})
-        if input_responses:
-            content = [_text("Received input:", json.dumps(input_responses))]
-        else:
-            out = await call_handler(spec["handler"], arguments)
-            content = out if isinstance(out, list) else [out]
-            if isinstance(out, dict) and "type" in out:
-                content = [out]
-        return mr({"content": content})
-
-    if method == "resources/list":
-        return mr({"resources": _resources_list(), "ttlMs": 60000, "cacheScope": "public"})
-
-    if method == "resources/templates/list":
-        return mr({"resourceTemplates": _templates_list(), "ttlMs": 60000, "cacheScope": "public"})
-
-    if method == "resources/read":
-        uri = params.get("uri", "")
-        r = RESOURCES.get(uri)
-        if not r:
-            raise RuntimeError(f"Resource not found: {uri}")
-        return mr({
-            "contents": [{"uri": uri, "mimeType": r["mimeType"], "text": r["text"]}],
-            "ttlMs": 60000,
-            "cacheScope": r.get("cacheScope", "private"),
-        })
-
-    if method == "prompts/list":
-        return mr({"prompts": _prompts_list(), "ttlMs": 60000, "cacheScope": "public"})
-
-    if method == "prompts/get":
-        name = params.get("name", "")
-        p = PROMPTS.get(name)
-        if not p:
-            raise RuntimeError(f"Prompt not found: {name}")
-        txt = p["text"]
-        try:
-            txt = txt.format(**params.get("arguments", {}))
-        except Exception:
-            pass
-        return mr({"description": p["description"], "messages": [{"role": "user", "content": {"type": "text", "text": txt}}],
-                   "ttlMs": 60000, "cacheScope": "public"})
-
-    if method == "completion/complete":
-        ref = params.get("ref", {})
-        argument = params.get("argument", {})
-        arg_name, arg_value = argument.get("name", ""), argument.get("value", "")
-        values = []
-        if ref.get("type") == "ref/prompt":
-            if ref.get("name") == "greet_user":
-                if arg_name == "style":
-                    values = [s for s in ["friendly", "formal", "casual"] if s.startswith(arg_value)]
-                elif arg_name == "name":
-                    values = [n for n in ["Jaden", "Alice", "Bob", "Charlie"] if n.lower().startswith(arg_value.lower())]
-            elif ref.get("name") == "pii_pci_analyzer" and arg_name == "category":
-                values = [c for c in ["pii", "pci", "phi"] if c.startswith(arg_value.lower())]
-        elif ref.get("type") == "ref/resource" and arg_name == "name":
-            values = [s for s in ["World", "test", "eicar", "Jaden", "Alice"] if s.lower().startswith(arg_value.lower())]
-        return mr({"completion": {"values": values, "total": len(values), "hasMore": False}})
-
-    if method == "subscriptions/listen":
-        return mr({"subscriptionId": str(uuid.uuid4())})
-
-    raise RuntimeError(f"Unknown method: {method}")
-
-# ---------------------------------------------------------------------------
-# HTTP app
-# ---------------------------------------------------------------------------
-
-def _hval(v):
-    """Header values must be latin-1 with no control chars (CR/LF, emoji, etc.)."""
-    return "".join(c if 32 <= ord(c) <= 255 else "?" for c in str(v))
-
-async def mcp_endpoint(request: Request):
-    body = await request.body()
-    try:
-        msg = json.loads(body or b"{}")
-    except json.JSONDecodeError:
-        return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
-
-    params = msg.get("params") or {}
-    req_meta = params.get("_meta", {})
-    rpc_id = msg.get("id")
-    method = msg.get("method")
-
-    # ---- version / session detection --------------------------------------
-    session_id = request.headers.get("mcp-session-id")
-    if method == "initialize":
-        session_id = str(uuid.uuid4())
-        ctx = {"version": LEGACY_VERSIONS[0], "session_id": session_id}
-        SESSIONS[session_id] = {"version": ctx["version"], "created": time.time()}
-    elif session_id and session_id in SESSIONS:
-        ctx = {"version": SESSIONS[session_id]["version"], "session_id": session_id}
-    else:
-        version = req_meta.get(META_PROTOCOL, PROTOCOL_VERSION)
-        ctx = {"version": version if version in SUPPORTED_VERSIONS else PROTOCOL_VERSION,
-               "session_id": None}
-
-    # NOTE: header values are sanitized (_hval) because tool/method names may
-    # contain control chars / unicode that are illegal in HTTP headers.
-    headers = {"MCP-Protocol-Version": _hval(ctx["version"])}
-    if ctx["session_id"]:
-        headers["Mcp-Session-Id"] = _hval(ctx["session_id"])
-    if method:
-        headers["Mcp-Method"] = _hval(method)
-    if method == "tools/call" and params.get("name"):
-        headers["Mcp-Name"] = _hval(params.get("name"))
-
-    if "id" not in msg:
-        return Response(b"", status_code=202, headers=headers)
-
-    try:
-        result = await dispatch(method, params, req_meta, ctx)
-        if ctx["session_id"]:
-            SESSIONS[ctx["session_id"]]["version"] = ctx["version"]
-            headers["MCP-Protocol-Version"] = _hval(ctx["version"])
-        resp = {"jsonrpc": "2.0", "id": rpc_id, "result": result}
-        return JSONResponse(resp, headers=headers)
-    except RuntimeError as e:
-        return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32601, "message": str(e)}}, headers=headers)
-
-# ---- REST API (Postman) ----
-
-def api_ping(_):
-    return JSONResponse({"status": "ok", "server": "mcp-2026-07-28-EVIL"})
-
-def api_summary(_):
-    return JSONResponse({
-        "protocol": PROTOCOL_VERSION,
-        "server": "EVIL (ENG-1226340 fixture)",
-        "mcp_tools": sorted(TOOLS.keys()),
-        "resources": sorted(RESOURCES.keys()),
-        "prompts": sorted(PROMPTS.keys()),
-        "rest_endpoints": ["/api/ping", "/api/summary", "/api/employees", "/api/pci", "/api/eicar", "/api/confidential"],
-    })
-
-def api_employees(_):
-    return JSONResponse({"employees": EMPLOYEES})
-
-def api_pci(_):
-    return JSONResponse({"cards": PCI_CARDS})
-
-def api_eicar(_):
-    return JSONResponse({"eicar": EICAR})
-
-def api_confidential(_):
-    return JSONResponse({"confidential": CONFIDENTIAL})
-
-app = Starlette(routes=[
-    Route("/mcp", mcp_endpoint, methods=["POST"]),
-    Route("/api/ping", api_ping, methods=["GET"]),
-    Route("/api/summary", api_summary, methods=["GET"]),
-    Route("/api/employees", api_employees, methods=["GET"]),
-    Route("/api/pci", api_pci, methods=["GET"]),
-    Route("/api/eicar", api_eicar, methods=["GET"]),
-    Route("/api/confidential", api_confidential, methods=["GET"]),
-])
-
+from starlette.responses import JSONResponse
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import (
+    ElicitResult,
+    GetPromptResult,
+    CreateMessageRequest,
+    SamplingMessage,
+    TextContent,
+    Completion,
+    ResourceTemplateReference,
+    PromptReference,
+)
+from dotenv import load_dotenv
+import os
 import uvicorn
 
-if __name__ == "__main__":
-    tools = ", ".join(sorted(TOOLS.keys())).encode("ascii", "backslashreplace").decode()
-    print(f"""
-{'=' * 68}
-  EVIL MCP Server — ENG-1226340 sanitization fixture (2026-07-28)
-{'=' * 68}
-  Endpoint:   http://0.0.0.0:{PORT}/mcp
-  Protocol:   {PROTOCOL_VERSION} (fallback: {', '.join(LEGACY_VERSIONS)})
-  serverInfo: ALWAYS hostile -> {SERVER_NAME.encode('ascii', 'backslashreplace').decode()!r}
+load_dotenv()
+port = int(os.environ.get("PORT", 10000))
 
-  Evil fixtures: 6 tools, 2 resources, 1 prompt
-  Tools: {tools}
-  REST API:   GET /api/summary
-{'=' * 68}
+mcp = FastMCP("Demo-All-Notifications")
+
+
+# =============================================================================
+# HELPER: NotificationCollector — captures notifications for inline response
+# =============================================================================
+
+class NotificationCollector:
+    """Stores notifications so they appear inline in the tool response."""
+
+    def __init__(self):
+        self.notifications: list[dict] = []
+
+    def add(self, notif_type: str, **kwargs):
+        entry = {"type": notif_type, "timestamp": time.time(), **kwargs}
+        self.notifications.append(entry)
+        print(f"[NOTIF] {notif_type}: {json.dumps(kwargs, default=str)}")
+
+    def snapshot(self) -> list[dict]:
+        return list(self.notifications)
+
+
+# =============================================================================
+# RESOURCE SUBSCRIPTIONS — enables ResourceUpdatedNotification to work
+# =============================================================================
+
+@mcp._mcp_server.subscribe_resource()
+async def handle_subscribe(uri: str) -> None:
+    """Acknowledge resource subscription."""
+    pass
+
+
+@mcp._mcp_server.unsubscribe_resource()
+async def handle_unsubscribe(uri: str) -> None:
+    """Acknowledge resource unsubscription."""
+    pass
+
+
+# =============================================================================
+# COMPLETION HANDLER — enables completion/complete (autocomplete)
+# =============================================================================
+
+@mcp.completion()
+async def handle_completion(ref, argument, context) -> Optional[Completion]:
+    """Provide autocomplete suggestions for prompts and resource templates."""
+
+    if isinstance(ref, PromptReference) and ref.name == "greet_user":
+        if argument.name == "style":
+            styles = ["friendly", "formal", "casual"]
+            matches = [s for s in styles if s.startswith(argument.value)]
+            return Completion(values=matches, total=len(matches), hasMore=False)
+        if argument.name == "name":
+            names = ["Jaden", "Alice", "Bob", "Charlie"]
+            matches = [n for n in names if n.lower().startswith(argument.value.lower())]
+            return Completion(values=matches, total=len(matches), hasMore=False)
+
+    if isinstance(ref, PromptReference) and ref.name == "pii_pci_analyzer":
+        if argument.name == "category":
+            categories = ["pii", "pci", "phi"]
+            matches = [c for c in categories if c.startswith(argument.value.lower())]
+            return Completion(values=matches, total=len(matches), hasMore=False)
+
+    if isinstance(ref, ResourceTemplateReference):
+        if argument.name == "name":
+            suggestions = ["World", "test", "eicar", "Jaden", "Alice"]
+            matches = [s for s in suggestions if s.lower().startswith(argument.value.lower())]
+            return Completion(values=matches, total=len(matches), hasMore=False)
+
+    return None
+
+
+# =============================================================================
+# NOTIFICATION TEST TOOLS (test_1 through test_9)
+# =============================================================================
+
+
+@mcp.tool()
+async def test_1_progress(ctx: Context = None) -> dict:
+    """
+    Test: ProgressNotification during execution.
+    Returns progress steps inline in the response.
+    """
+    nc = NotificationCollector()
+    steps = 5
+    for i in range(1, steps + 1):
+        progress_pct = (i / steps) * 100
+        msg = f"Step {i}/{steps} ({progress_pct:.0f}%)"
+        nc.add("ProgressNotification", progress=progress_pct, total=100, message=msg)
+        if ctx:
+            await ctx.report_progress(progress=progress_pct, total=100, message=msg)
+        await asyncio.sleep(0.3)
+    return {
+        "status": "ok",
+        "description": "ProgressNotification test — 5 steps",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_2_logging(ctx: Context = None) -> dict:
+    """
+    Test: LoggingMessageNotification at all severity levels.
+    """
+    nc = NotificationCollector()
+    for level in ["debug", "info", "notice", "warning", "error", "critical"]:
+        data = f"Log message at {level.upper()} level"
+        nc.add("LoggingMessageNotification", level=level, logger="demo-logger", data=data)
+        if ctx:
+            await ctx.session.send_log_message(level=level, data=data, logger="demo-logger")
+    return {
+        "status": "ok",
+        "description": "LoggingMessageNotification — all 6 levels",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_3_tool_list_changed(ctx: Context = None) -> dict:
+    """
+    Test: ToolListChangedNotification.
+    Client should re-fetch tools/list after this.
+    """
+    nc = NotificationCollector()
+    nc.add("ToolListChangedNotification", info="Client should re-fetch tools/list")
+    if ctx:
+        await ctx.session.send_tool_list_changed()
+    return {
+        "status": "ok",
+        "description": "ToolListChangedNotification sent",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_4_resource_list_changed(ctx: Context = None) -> dict:
+    """
+    Test: ResourceListChangedNotification.
+    Client should re-fetch resources/list after this.
+    """
+    nc = NotificationCollector()
+    nc.add("ResourceListChangedNotification", info="Client should re-fetch resources/list")
+    if ctx:
+        await ctx.session.send_resource_list_changed()
+    return {
+        "status": "ok",
+        "description": "ResourceListChangedNotification sent",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_5_prompt_list_changed(ctx: Context = None) -> dict:
+    """
+    Test: PromptListChangedNotification.
+    Client should re-fetch prompts/list after this.
+    """
+    nc = NotificationCollector()
+    nc.add("PromptListChangedNotification", info="Client should re-fetch prompts/list")
+    if ctx:
+        await ctx.session.send_prompt_list_changed()
+    return {
+        "status": "ok",
+        "description": "PromptListChangedNotification sent",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_6_resource_updated(
+    resource_uri: str = "greeting://test",
+    ctx: Context = None,
+) -> dict:
+    """
+    Test: ResourceUpdatedNotification for a given URI.
+    If the client subscribed to this resource, it will re-read it.
+    """
+    nc = NotificationCollector()
+    nc.add("ResourceUpdatedNotification", uri=resource_uri)
+    if ctx:
+        await ctx.session.send_resource_updated(uri=resource_uri)
+    return {
+        "status": "ok",
+        "description": f"ResourceUpdatedNotification sent for {resource_uri}",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_7_cancellable(ctx: Context = None) -> dict:
+    """
+    Test: Long-running operation that respects CancelledNotification.
+    10 steps at 1 second each — cancel mid-way to test cancellation.
+    """
+    nc = NotificationCollector()
+    try:
+        for i in range(1, 11):
+            nc.add("ProgressNotification", progress=i, total=10, message=f"Cancellable step {i}/10")
+            if ctx:
+                await ctx.report_progress(progress=i, total=10, message=f"Cancellable step {i}/10")
+            await asyncio.sleep(1.0)
+        return {
+            "status": "ok",
+            "description": "Completed all 10 steps (not cancelled)",
+            "notifications_sent": nc.snapshot(),
+        }
+    except Exception as e:
+        nc.add("CancelledNotification", reason=str(e))
+        return {
+            "status": "cancelled",
+            "description": f"Request cancelled at step {i}",
+            "notifications_sent": nc.snapshot(),
+        }
+
+
+@mcp.tool()
+async def test_8_elicit_complete(
+    outcome: str = "accept",
+    ctx: Context = None,
+) -> dict:
+    """
+    Test: ElicitCompleteNotification.
+    outcome = 'accept' or 'decline'.
+    """
+    nc = NotificationCollector()
+    nc.add("ElicitCompleteNotification", outcome=outcome)
+    if ctx:
+        try:
+            if outcome == "accept":
+                await ctx.session.send_elicit_complete(
+                    outcome="accept",
+                    result={"submitted_by": "test-user", "approved": True},
+                )
+            else:
+                await ctx.session.send_elicit_complete(outcome="decline")
+        except AttributeError:
+            # Fallback for older MCP SDK
+            from mcp.types import ElicitCompleteNotification, ElicitCompleteNotificationParams
+            await ctx.session.send_notification(
+                ElicitCompleteNotification(
+                    method="notifications/elicitation/complete",
+                    params=ElicitCompleteNotificationParams(
+                        outcome="accept" if outcome == "accept" else "decline",
+                        result={"submitted_by": "test-user", "approved": True} if outcome == "accept" else None,
+                    ),
+                )
+            )
+    return {
+        "status": "ok",
+        "description": f"ElicitCompleteNotification sent with outcome='{outcome}'",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+@mcp.tool()
+async def test_9_burst(ctx: Context = None) -> dict:
+    """
+    Test: ALL notification types in rapid succession (burst test).
+    """
+    nc = NotificationCollector()
+
+    nc.add("ProgressNotification", progress=50, total=100, message="Burst at 50%")
+    if ctx:
+        await ctx.report_progress(progress=50, total=100)
+
+    nc.add("LoggingMessageNotification", level="info", data="Burst log")
+    if ctx:
+        await ctx.session.send_log_message(level="info", data="Burst log")
+
+    nc.add("ToolListChangedNotification")
+    if ctx:
+        await ctx.session.send_tool_list_changed()
+
+    nc.add("ResourceListChangedNotification")
+    if ctx:
+        await ctx.session.send_resource_list_changed()
+
+    nc.add("PromptListChangedNotification")
+    if ctx:
+        await ctx.session.send_prompt_list_changed()
+
+    nc.add("ResourceUpdatedNotification", uri="greeting://test")
+    if ctx:
+        await ctx.session.send_resource_updated(uri="greeting://test")
+
+    nc.add("ElicitCompleteNotification", outcome="accept")
+    if ctx:
+        try:
+            await ctx.session.send_elicit_complete(outcome="accept", result={"burst": True})
+        except AttributeError:
+            from mcp.types import ElicitCompleteNotification, ElicitCompleteNotificationParams
+            await ctx.session.send_notification(
+                ElicitCompleteNotification(
+                    method="notifications/elicitation/complete",
+                    params=ElicitCompleteNotificationParams(outcome="accept", result={"burst": True}),
+                )
+            )
+
+    nc.add("ProgressNotification", progress=100, total=100, message="Burst complete")
+    if ctx:
+        await ctx.report_progress(progress=100, total=100)
+
+    return {
+        "status": "ok",
+        "description": "Burst: all 7 notification types in rapid succession",
+        "notifications_sent": nc.snapshot(),
+    }
+
+
+# =============================================================================
+# REST API ENDPOINTS — Plain JSON, no SSE, perfect for Postman
+# =============================================================================
+
+@mcp.custom_route("/api/ping", methods=["GET"])
+async def api_ping(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "server": "mcp-all-notifications"})
+
+
+@mcp.custom_route("/api/summary", methods=["GET"])
+async def api_summary(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "server": "MCP Notification Test Server",
+        "mcp_tools": [
+            "test_1_progress           — ProgressNotification",
+            "test_2_logging            — LoggingMessageNotification (6 levels)",
+            "test_3_tool_list_changed   — ToolListChangedNotification",
+            "test_4_resource_list_changed — ResourceListChangedNotification",
+            "test_5_prompt_list_changed — PromptListChangedNotification",
+            "test_6_resource_updated    — ResourceUpdatedNotification",
+            "test_7_cancellable         — CancelledNotification (10s, cancellable)",
+            "test_8_elicit_complete     — ElicitCompleteNotification",
+            "test_9_burst               — ALL 7 notifications in one call",
+        ],
+        "rest_endpoints": [
+            "GET /api/ping",
+            "GET /api/summary",
+            "GET /api/test/progress",
+            "GET /api/test/logging",
+            "GET /api/test/tool-list-changed",
+            "GET /api/test/resource-list-changed",
+            "GET /api/test/prompt-list-changed",
+            "GET /api/test/resource-updated?uri=...",
+            "GET /api/test/elicit-complete?outcome=...",
+            "GET /api/test/burst",
+        ],
+    })
+
+
+@mcp.custom_route("/api/test/progress", methods=["GET", "POST"])
+async def api_test_progress(request: Request) -> JSONResponse:
+    notifications = []
+    steps = 5
+    for i in range(1, steps + 1):
+        progress_pct = round((i / steps) * 100, 1)
+        notifications.append({
+            "type": "ProgressNotification", "step": i,
+            "progress": progress_pct, "total": 100,
+            "message": f"Step {i}/{steps} ({progress_pct:.0f}%)",
+        })
+        await asyncio.sleep(0.3)
+    return JSONResponse({"status": "ok", "notifications": notifications, "count": len(notifications)})
+
+
+@mcp.custom_route("/api/test/logging", methods=["GET", "POST"])
+async def api_test_logging(request: Request) -> JSONResponse:
+    notifications = []
+    for level in ["debug", "info", "notice", "warning", "error", "critical"]:
+        notifications.append({
+            "type": "LoggingMessageNotification", "level": level,
+            "logger": "demo-logger", "data": f"Log at {level.upper()}",
+        })
+    return JSONResponse({"status": "ok", "notifications": notifications, "count": len(notifications)})
+
+
+@mcp.custom_route("/api/test/tool-list-changed", methods=["GET", "POST"])
+async def api_test_tool_list_changed(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "notifications": [{"type": "ToolListChangedNotification"}]})
+
+
+@mcp.custom_route("/api/test/resource-list-changed", methods=["GET", "POST"])
+async def api_test_resource_list_changed(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "notifications": [{"type": "ResourceListChangedNotification"}]})
+
+
+@mcp.custom_route("/api/test/prompt-list-changed", methods=["GET", "POST"])
+async def api_test_prompt_list_changed(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "notifications": [{"type": "PromptListChangedNotification"}]})
+
+
+@mcp.custom_route("/api/test/resource-updated", methods=["GET", "POST"])
+async def api_test_resource_updated(request: Request) -> JSONResponse:
+    uri = request.query_params.get("uri", "greeting://test")
+    return JSONResponse({"status": "ok", "notifications": [{"type": "ResourceUpdatedNotification", "uri": uri}]})
+
+
+@mcp.custom_route("/api/test/elicit-complete", methods=["GET", "POST"])
+async def api_test_elicit_complete(request: Request) -> JSONResponse:
+    outcome = request.query_params.get("outcome", "accept")
+    result = {"submitted_by": "test-user", "approved": True} if outcome == "accept" else None
+    return JSONResponse({"status": "ok", "notifications": [{"type": "ElicitCompleteNotification", "outcome": outcome, "result": result}]})
+
+
+@mcp.custom_route("/api/test/burst", methods=["GET", "POST"])
+async def api_test_burst(request: Request) -> JSONResponse:
+    notifications = [
+        {"type": "ProgressNotification", "progress": 50, "total": 100},
+        {"type": "LoggingMessageNotification", "level": "info", "data": "Burst"},
+        {"type": "ToolListChangedNotification"},
+        {"type": "ResourceListChangedNotification"},
+        {"type": "PromptListChangedNotification"},
+        {"type": "ResourceUpdatedNotification", "uri": "greeting://test"},
+        {"type": "ElicitCompleteNotification", "outcome": "accept"},
+    ]
+    return JSONResponse({"status": "ok", "notifications": notifications, "count": len(notifications)})
+
+
+# =============================================================================
+# ORIGINAL TOOLS
+# =============================================================================
+
+@mcp.tool()
+async def greet(name: str = "World", ctx: Context = None) -> str:
+    """Greet someone using LLM sampling"""
+    result = await ctx.session.create_message(
+        CreateMessageRequest(
+            messages=[
+                SamplingMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=f"Write a short, warm greeting for someone named {name}.",
+                    ),
+                )
+            ],
+            systemPrompt="You are a friendly assistant. Keep it to one sentence.",
+            maxTokens=100,
+        )
+    )
+    return result.content.text
+
+
+@mcp.tool()
+async def add(a: int, b: int, ctx: Context = None) -> str:
+    """Add two numbers and explain the result via LLM"""
+    result = await ctx.session.create_message(
+        CreateMessageRequest(
+            messages=[
+                SamplingMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=f"Explain in one friendly sentence what {a} + {b} equals.",
+                    ),
+                )
+            ],
+            maxTokens=60,
+        )
+    )
+    return result.content.text
+
+
+@mcp.tool()
+async def list_roots(ctx: Context = None) -> str:
+    """List root directories from the client (calls roots/list)."""
+    result = await ctx.session.list_roots()
+    if result.roots:
+        roots = [f"{r.uri} ({r.name or 'unnamed'})" for r in result.roots]
+        return f"Root directories: {', '.join(roots)}"
+    return "No roots available from client."
+
+
+@mcp.tool()
+async def list_templates(ctx: Context = None) -> str:
+    """List all registered resource URI templates"""
+    templates = await ctx.session.list_resource_templates()
+    names = [t.uriTemplate for t in templates.resourceTemplates]
+    return f"Available templates: {', '.join(names)}"
+
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+@mcp.resource("greeting://{name}")
+def get_greeting(name: str) -> str:
+    return f"Hello, {name}!"
+
+@mcp.resource("greeting://eicar")
+def get_greeting_eicar() -> str:
+    return r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+
+@mcp.resource("greeting://test")
+def get_greeting_test() -> str:
+    return "Hello, test!"
+
+@mcp.resource("confidential://news")
+def get_confidential_news() -> str:
+    return "Bob's Bank is planning to acquire Fabio Insurance in February 2026"
+
+@mcp.resource("employees://details")
+def get_employee_details() -> dict:
+    employees = [
+        {"id": 101, "name": "Alice Johnson", "role": "Software Engineer", "department": "Engineering", "email": "alice.johnson@bobsbank.net", "location": "New York"},
+        {"id": 102, "name": "Bob Smith", "role": "QA Engineer", "department": "Quality Assurance", "email": "bob.smith@bobsbank.net", "location": "San Francisco"},
+        {"id": 103, "name": "Charlie Brown", "role": "Product Manager", "department": "Product", "email": "charlie.brown@bobsbank.net", "location": "London"},
+        {"id": 104, "name": "Diana Prince", "role": "DevOps Engineer", "department": "Infrastructure", "email": "diana.prince@bobsbank.net", "location": "Berlin"},
+        {"id": 105, "name": "Ethan Hunt", "role": "Security Analyst", "department": "Cybersecurity", "email": "ethan.hunt@bobsbank.net", "location": "Singapore"},
+        {"id": 106, "name": "Fiona Gallagher", "role": "Data Scientist", "department": "Data Analytics", "email": "fiona.gallagher@bobsbank.net", "location": "Toronto"},
+        {"id": 107, "name": "George Miller", "role": "UI/UX Designer", "department": "Design", "email": "george.miller@bobsbank.net", "location": "Sydney"},
+        {"id": 108, "name": "Hannah Lee", "role": "Frontend Developer", "department": "Engineering", "email": "hannah.lee@bobsbank.net", "location": "Tokyo"},
+        {"id": 109, "name": "Ian Wright", "role": "Backend Developer", "department": "Engineering", "email": "ian.wright@bobsbank.net", "location": "Dublin"},
+        {"id": 110, "name": "Julia Roberts", "role": "HR Manager", "department": "Human Resources", "email": "julia.roberts@bobsbank.net", "location": "Amsterdam"},
+    ]
+    return {"employees": employees}
+
+
+# =============================================================================
+# PROMPTS
+# =============================================================================
+
+@mcp.prompt()
+def greet_user(name: str = "Jaden", style: str = "friendly") -> GetPromptResult:
+    styles = {
+        "friendly": "Please write a warm, friendly greeting",
+        "formal": "Please write a formal, professional greeting",
+        "casual": "Please write a casual, relaxed greeting",
+    }
+    prompt_text = f"{styles.get(style, styles['friendly'])} for someone named {name}."
+    return GetPromptResult(
+        description="A prompt that asks for a specific style of greeting.",
+        messages=[{"role": "user", "content": {"type": "text", "text": prompt_text}}],
+        metadata={"style": style},
+    )
+
+
+@mcp.prompt()
+def pii_pci_analyzer(text: str, category: str = "pii") -> GetPromptResult:
+    categories = {
+        "pii": "Identify PII (Personally Identifiable Information) in the text.",
+        "pci": "Identify PCI (Payment Card Information) in the text.",
+        "phi": "Identify PHI (Protected Health Information) in the text.",
+    }
+    instruction = categories.get(category, categories["pii"])
+    prompt_text = f"{instruction}\n\nText to analyze:\n{text}\n\nRespond with yes/no + explanation."
+    return GetPromptResult(
+        description="A prompt for detecting sensitive data (PII/PCI/PHI).",
+        messages=[{"role": "user", "content": {"type": "text", "text": prompt_text}}],
+        metadata={"category": category},
+    )
+
+
+# =============================================================================
+# ELICIT TOOLS
+# =============================================================================
+
+@mcp.tool()
+def elicit_feedback(question: str) -> ElicitResult:
+    return ElicitResult(
+        action="accept",
+        content={"type": "text", "text": f"Can you share your thoughts on: {question}?"},
+    )
+
+
+@mcp.tool()
+async def collect_user_info(ctx: Context = None) -> str:
+    result = await ctx.elicit(
+        message="Please provide your name and preferred language.",
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Your name"},
+                "language": {"type": "string", "description": "Preferred language"},
+            },
+            "required": ["name", "language"],
+        },
+    )
+    if result.action == "accept":
+        data = result.data
+        return f"Hello {data['name']}! I'll respond in {data['language']}."
+    return "No info provided."
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    print(f"""
+{'='*65}
+  MCP Notification Server — Complete Edition
+{'='*65}
+
+  MCP Tools (POST /mcp):
+    test_1_progress           test_2_logging
+    test_3_tool_list_changed  test_4_resource_list_changed
+    test_5_prompt_list_changed test_6_resource_updated
+    test_7_cancellable        test_8_elicit_complete
+    test_9_burst              greet / add / list_roots / list_templates
+
+  REST API (GET /api/*):
+    /api/summary              /api/test/burst
+    /api/test/progress        /api/test/logging
+    ... see /api/summary for all
+
+  New capabilities:
+    resources/subscribe       resources/unsubscribe
+    completion/complete       roots/list
+{'='*65}
 """)
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(mcp.streamable_http_app, host="0.0.0.0", port=port)
